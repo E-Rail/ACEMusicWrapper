@@ -6,6 +6,8 @@ import html
 import json
 import os
 import re
+import subprocess
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -27,18 +29,20 @@ LLM_TIMEOUT = 120.0
 ACE_TIMEOUT = 660.0
 POLL_INTERVAL = 5
 MAX_POLLS = 120
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2.0
 
 PREFERRED_LLM_MODELS = [
     "deepseek/deepseek-v4-flash",
     "deepseek-v4-flash",
-    "xiaomi/mimo-v2.5-pro",
-    "xiaomi/mimo-v2.5",
 ]
 SUGGESTED_MODELS = {"deepseek/deepseek-v4-flash", "deepseek-v4-flash"}
 SUGGESTED_SUFFIX = " (Suggested)"
 BING_URLS = ("https://cn.bing.com/search", "https://www.bing.com/search")
-AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma")
+AUDIO_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma", ".mp4")
+REFERENCE_TASKS = {"cover", "repaint", "lego", "extract", "complete"}
 MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
+REFERENCE_META: dict[str, str] = {}
 
 
 CSS = """
@@ -205,9 +209,147 @@ def bing_search(query: str, limit: int = 4) -> list[dict[str, str]]:
     return []
 
 
+def mentions(result: dict[str, str], term: str) -> bool:
+    haystack = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+    return term.lower() in haystack
+
+
+def page_context_windows(query: str, term: str, limit: int = 3) -> list[dict[str, str]]:
+    pages = [
+        ("https://m.baidu.com/s", {"word": query}),
+    ]
+    contexts: list[dict[str, str]] = []
+    for url, params in pages:
+        try:
+            response = httpx.get(
+                url,
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                timeout=SEARCH_TIMEOUT,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+        except Exception:
+            continue
+
+        text = re.sub(r"<(script|style).*?</\1>", " ", response.text, flags=re.S | re.I)
+        text = re.sub(r"\s+", " ", strip_tags(text))
+        for match in re.finditer(re.escape(term), text, flags=re.I):
+            start = max(match.start() - 120, 0)
+            end = min(match.end() + 220, len(text))
+            snippet = text[start:end].strip()
+            if any(bad in snippet.lower() for bad in ("<link", "aria-", "rel=", "autocomplete=", "spellcheck=")):
+                continue
+            if snippet and all(snippet != item["snippet"] for item in contexts):
+                contexts.append({"title": f"{term} search context", "url": str(response.url), "snippet": snippet})
+            if len(contexts) >= limit:
+                return contexts
+    return contexts
+
+
+def source_title(prompt: str) -> str:
+    clean = re.sub(r"https?://\S+", "", prompt or "").strip()
+    clean = clean.replace("“", '"').replace("”", '"').replace("《", '"').replace("》", '"')
+    quoted = re.findall(r'"([^"]+)"', clean)
+    if quoted:
+        return quoted[0].strip()
+
+    markers = [
+        "改编成", "改编为", "改成", "改为", "改编", "改",
+        "翻唱成", "翻唱为", "翻唱", "重混", "混音",
+        "remix", "cover", "repaint", "edit",
+    ]
+    lower = clean.lower()
+    positions = [lower.find(marker.lower()) for marker in markers if lower.find(marker.lower()) > 0]
+    if positions:
+        clean = clean[: min(positions)]
+    clean = re.sub(r"^(把|将|请把|请将)\s*", "", clean).strip()
+    clean = re.sub(r"['’]s$", "", clean).strip()
+    return clean[:80]
+
+
+def edit_target(prompt: str) -> str:
+    markers = ["改编成", "改编为", "改成", "改为", "改编", "改", "翻唱成", "翻唱为", "remix", "cover", "edit"]
+    lower = (prompt or "").lower()
+    for marker in markers:
+        pos = lower.find(marker.lower())
+        if pos >= 0:
+            return prompt[pos + len(marker):].strip()[:80]
+    return ""
+
+
+def music_context_search(prompt: str) -> list[dict[str, str]]:
+    title = source_title(prompt)
+    target = edit_target(prompt)
+    queries = [prompt]
+    if title and source_edit(prompt):
+        queries = [
+            f"{title} 歌曲 原唱 作曲 编曲 BPM 调性",
+            f"{title} 官方 音频 试听 歌曲信息",
+            f"{title} 歌曲 风格 节奏 编曲",
+            f"{title} {target} 改编 编曲" if target else f"{title} 改编 编曲",
+        ]
+
+    snippets: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for query in queries:
+        for result in bing_search(query, limit=3):
+            if title and source_edit(prompt) and not mentions(result, title):
+                continue
+            key = result.get("url") or result.get("title") or result.get("snippet", "")[:80]
+            if key and key not in seen:
+                snippets.append(result)
+                seen.add(key)
+            if len(snippets) >= 8:
+                return snippets
+        if title and source_edit(prompt):
+            for result in page_context_windows(query, title, limit=3):
+                key = result.get("url", "") + result.get("snippet", "")[:80]
+                if key and key not in seen:
+                    snippets.append(result)
+                    seen.add(key)
+                if len(snippets) >= 8:
+                    return snippets
+    return snippets
+
+
+def bing_result_links(query: str, limit: int = 8) -> list[str]:
+    links: list[str] = []
+    for search in (
+        f"{query} 试听 mp3 m4a wav",
+        f"{query} official audio preview mp3 m4a",
+        f"{query} site:music.163.com OR site:y.qq.com OR site:kuwo.cn OR site:kugou.com",
+    ):
+        for result in bing_search(search, limit=limit):
+            url = result.get("url", "")
+            if url and url not in links:
+                links.append(url)
+    return links[:limit]
+
+
 def direct_audio_urls(text: str) -> list[str]:
     urls = re.findall(r"https?://[^\s\"'<>),]+", text or "")
     return [url for url in urls if urlparse(url).path.lower().endswith(AUDIO_EXTS)]
+
+
+def provider_json(
+    method: str,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+    referer: str = "",
+) -> Any:
+    request_headers = {"User-Agent": "Mozilla/5.0"}
+    if referer:
+        request_headers["Referer"] = referer
+    if method == "POST":
+        request_headers["Content-Type"] = "application/json"
+        response = httpx.post(url, headers=request_headers, json=payload or {}, timeout=SEARCH_TIMEOUT)
+    else:
+        response = httpx.get(url, headers=request_headers, params=params, timeout=SEARCH_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
 
 
 def search_terms(prompt: str) -> list[str]:
@@ -216,49 +358,340 @@ def search_terms(prompt: str) -> list[str]:
     artist_match = re.search(r"(?:edit|cover|remix)?\s*([a-z0-9 .&-]+?)(?:'s| by | - |:)", prompt, re.I)
     artist = artist_match.group(1).strip(" .-&") if artist_match else ""
     terms = []
+    title = source_title(prompt)
+    if title:
+        terms.append(title)
     if quoted:
         terms += [" ".join(x for x in (artist, quoted[0]) if x), " ".join(quoted), quoted[0]]
     terms.append(prompt)
     return [term for term in dict.fromkeys(t for t in terms if t.strip())]
 
 
-def itunes_preview(prompt: str) -> str | None:
+def reference_search_queries(prompt: str) -> list[str]:
+    queries: list[str] = []
     for term in search_terms(prompt):
+        queries.extend(
+            [
+                term,
+                f"{term} 官方音频",
+                f"{term} 官方MV",
+                f"{term} 原唱",
+                f"{term} 试听",
+                f"{term} QQ音乐",
+                f"{term} 网易云音乐",
+                f"{term} 酷狗音乐",
+                f"{term} official audio",
+                f"{term} preview",
+            ]
+        )
+    return [query for query in dict.fromkeys(q for q in queries if q.strip())]
+
+
+def reference_meta_label(provider: str, title: str, artist: str = "", album: str = "", kind: str = "song") -> str:
+    return " - ".join(part for part in (f"{provider} {kind}", title, artist, album) if part)
+
+
+def netease_song_url(song_id: int) -> str | None:
+    data = provider_json(
+        "GET",
+        "https://music.163.com/api/song/enhance/player/url",
+        params={"ids": json.dumps([song_id]), "br": 320000},
+        referer="https://music.163.com/",
+    )
+    for item in data.get("data", []):
+        url = item.get("url") if isinstance(item, dict) else None
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
+    return None
+
+
+def netease_mv_url(mvid: int) -> tuple[str | None, int | None]:
+    data = provider_json(
+        "GET",
+        "https://music.163.com/api/mv/detail",
+        params={"id": mvid, "type": "mp4"},
+        referer="https://music.163.com/",
+    )
+    mv = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(mv, dict):
+        return None, None
+    brs = mv.get("brs")
+    if not isinstance(brs, dict) or not brs:
+        return None, mv.get("duration")
+    def quality(item: tuple[str, Any]) -> int:
         try:
-            response = httpx.get(
-                "https://itunes.apple.com/search",
-                params={"term": term, "entity": "song", "limit": 5, "country": "us"},
-                timeout=SEARCH_TIMEOUT,
-            )
-            response.raise_for_status()
-            data = response.json()
+            return int(item[0])
         except Exception:
+            return 0
+    for _, url in sorted(brs.items(), key=quality, reverse=True):
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url, mv.get("duration")
+    return None, mv.get("duration")
+
+
+def netease_reference(prompt: str) -> str | None:
+    title = source_title(prompt)
+    if not title:
+        return None
+    try:
+        data = provider_json(
+            "GET",
+            "https://music.163.com/api/search/get/web",
+            params={"s": title, "type": 1, "limit": 8, "offset": 0},
+            referer="https://music.163.com/",
+        )
+    except Exception:
+        return None
+    songs = data.get("result", {}).get("songs", [])
+    if not isinstance(songs, list):
+        return None
+    for song in songs:
+        if not isinstance(song, dict):
             continue
-        for item in data.get("results", []):
-            url = item.get("previewUrl") if isinstance(item, dict) else None
-            if isinstance(url, str) and urlparse(url).path.lower().endswith(AUDIO_EXTS):
+        name = str(song.get("name") or "")
+        if title not in name and not any(title in str(alias) for alias in song.get("alias", [])):
+            continue
+        artists = song.get("artists") if isinstance(song.get("artists"), list) else []
+        artist = " / ".join(str(a.get("name") or "") for a in artists if isinstance(a, dict))
+        album = song.get("album") if isinstance(song.get("album"), dict) else {}
+        album_name = str(album.get("name") or "")
+        song_id = song.get("id")
+        if isinstance(song_id, int):
+            try:
+                url = netease_song_url(song_id)
+            except Exception:
+                url = None
+            if url:
+                REFERENCE_META[url] = reference_meta_label("NetEase", name, artist, album_name, "song")
+                return url
+        mvid = song.get("mvid")
+        if isinstance(mvid, int) and mvid > 0:
+            try:
+                url, duration_ms = netease_mv_url(mvid)
+            except Exception:
+                url, duration_ms = None, None
+            if url:
+                meta = reference_meta_label("NetEase", name, artist, album_name, "official MV")
+                if duration_ms:
+                    meta += f" ({duration_ms / 1000:.1f}s)"
+                REFERENCE_META[url] = meta
+                return url
+    return None
+
+
+def qq_song_url(songmid: str) -> str | None:
+    payload = {
+        "req": {
+            "module": "CDN.SrfCdnDispatchServer",
+            "method": "GetCdnDispatch",
+            "param": {"guid": "10000", "calltype": 0, "userip": ""},
+        },
+        "req_0": {
+            "module": "vkey.GetVkeyServer",
+            "method": "CgiGetVkey",
+            "param": {
+                "guid": "10000",
+                "songmid": [songmid],
+                "songtype": [0],
+                "uin": "0",
+                "loginflag": 1,
+                "platform": "20",
+            },
+        },
+        "comm": {"uin": 0, "format": "json", "ct": 24, "cv": 0},
+    }
+    data = provider_json("POST", "https://u.y.qq.com/cgi-bin/musicu.fcg", payload=payload, referer="https://y.qq.com/")
+    req = data.get("req_0", {}).get("data", {})
+    info = req.get("midurlinfo", [{}])[0]
+    purl = info.get("purl") if isinstance(info, dict) else ""
+    if not purl:
+        return None
+    for sip in req.get("sip", []):
+        if isinstance(sip, str) and sip.startswith(("http://", "https://")):
+            return urljoin(sip, purl)
+    return None
+
+
+def qq_mv_url(vid: str) -> str | None:
+    payload = {
+        "getMvUrl": {
+            "module": "gosrf.Stream.MvUrlProxy",
+            "method": "GetMvUrls",
+            "param": {"vids": [vid], "request_typet": 10001},
+        },
+        "comm": {"ct": 24, "cv": 0},
+    }
+    data = provider_json("POST", "https://u.y.qq.com/cgi-bin/musicu.fcg", payload=payload, referer="https://y.qq.com/")
+    items = data.get("getMvUrl", {}).get("data", {}).get(vid, {}).get("mp4", [])
+    if not isinstance(items, list):
+        return None
+    items = sorted(
+        [item for item in items if isinstance(item, dict)],
+        key=lambda item: int(item.get("fileSize") or 0),
+        reverse=True,
+    )
+    for item in items:
+        for url in item.get("url", []):
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return url
+    return None
+
+
+def qq_reference(prompt: str) -> str | None:
+    title = source_title(prompt)
+    if not title:
+        return None
+    try:
+        data = provider_json(
+            "GET",
+            "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+            params={"w": title, "format": "json", "p": 1, "n": 8},
+            referer="https://y.qq.com/",
+        )
+    except Exception:
+        return None
+    songs = data.get("data", {}).get("song", {}).get("list", [])
+    if not isinstance(songs, list):
+        return None
+    for song in songs:
+        if not isinstance(song, dict):
+            continue
+        name = str(song.get("songname") or "")
+        if title not in name:
+            continue
+        artists = song.get("singer") if isinstance(song.get("singer"), list) else []
+        artist = " / ".join(str(a.get("name") or "") for a in artists if isinstance(a, dict))
+        album = str(song.get("albumname") or "")
+        songmid = str(song.get("songmid") or "")
+        if songmid:
+            try:
+                url = qq_song_url(songmid)
+            except Exception:
+                url = None
+            if url:
+                REFERENCE_META[url] = reference_meta_label("QQ Music", name, artist, album, "song")
+                return url
+        vid = str(song.get("vid") or "")
+        if vid:
+            try:
+                url = qq_mv_url(vid)
+            except Exception:
+                url = None
+            if url:
+                REFERENCE_META[url] = reference_meta_label("QQ Music", name, artist, album, "official MV")
+                return url
+    return None
+
+
+def itunes_preview(prompt: str) -> str | None:
+    wanted_title = source_title(prompt).lower()
+    countries = ("cn", "hk", "tw", "us", "jp")
+    for term in reference_search_queries(prompt):
+        for country in countries:
+            try:
+                response = httpx.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": term, "entity": "song", "limit": 10, "country": country},
+                    timeout=SEARCH_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except Exception:
+                continue
+            fallback: str | None = None
+            for item in data.get("results", []):
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("previewUrl")
+                if not isinstance(url, str) or not urlparse(url).path.lower().endswith(AUDIO_EXTS):
+                    continue
+                track = str(item.get("trackName") or "").lower()
+                collection = str(item.get("collectionName") or "").lower()
+                artist = str(item.get("artistName") or "").lower()
+                haystack = f"{track} {collection} {artist}"
+                if wanted_title and wanted_title in haystack:
+                    REFERENCE_META[url] = " - ".join(
+                        part
+                        for part in (
+                            str(item.get("trackName") or "").strip(),
+                            str(item.get("artistName") or "").strip(),
+                            str(item.get("collectionName") or "").strip(),
+                        )
+                        if part
+                    )
+                    return url
+                if not fallback:
+                    fallback = url
+                    REFERENCE_META[url] = " - ".join(
+                        part
+                        for part in (
+                            str(item.get("trackName") or "").strip(),
+                            str(item.get("artistName") or "").strip(),
+                            str(item.get("collectionName") or "").strip(),
+                        )
+                        if part
+                    )
+            if fallback and not wanted_title:
+                return fallback
+    return None
+
+
+def wider_reference_audio(prompt: str) -> str | None:
+    for url in direct_audio_urls(prompt):
+        return url
+    for provider in (netease_reference, qq_reference):
+        url = provider(prompt)
+        if url:
+            return url
+    preview = itunes_preview(prompt)
+    if preview:
+        return preview
+    for query in reference_search_queries(prompt):
+        for url in bing_result_links(query):
+            if urlparse(url).path.lower().endswith(AUDIO_EXTS):
                 return url
     return None
 
 
 def llm_messages(prompt: str, snippets: list[dict[str, str]], audio_hint: str | None) -> list[dict[str, str]]:
+    title = source_title(prompt) if source_edit(prompt) else ""
+    target = edit_target(prompt) if source_edit(prompt) else ""
     system = """
 You are a concise composer agent for ACE-Step music generation.
 Return strict JSON only: {"candidates":[...]} with exactly 3 candidates.
 Each candidate needs: title, concept, prompt, lyrics, bpm, key_scale,
 time_signature, audio_duration, vocal_language, small_edit_instructions,
-composition_plan, reference_audio_url, source_reference_query, ace_task_type.
+composition_plan, ace_task_type.
 Use section-tagged lyrics: [Intro], [Verse 1], [Chorus], [Bridge], [Outro].
-For source edits/covers, preserve the source and change only what the user asks.
+For source edits/covers, every candidate must be an edit strategy for the same
+detected source song. Do not create unrelated songs or alternate originals.
+Preserve the source and change only what the user asks.
 Do not reconstruct protected lyrics or melody from memory/search; use placeholders
-and reference_audio_url when a verified URL is available. For new music, provide
+for source lyrics/audio. The app, not you, decides whether reference search is needed
+and finds reference audio. Do not return reference_audio_url, source_reference_query,
+or needs_reference_search. For new music, provide
 a specific section/beat/chord/instrument/vocal/energy plan.
-ace_task_type is "text2music" for new music and usually "cover" for edits.
+For Chinese source-edit prompts like "孤勇者改成钢琴曲", treat the text before
+"改成/改为/改编/翻唱" as the source song title and the text after it as the
+requested arrangement edit. Do not invent a different song.
+ACE task mapping:
+- text2music: new music from silence, no reference needed.
+- cover: source/cover/remix/edit with full-track target, reference needed.
+- repaint: edit a section of existing audio, reference needed.
+- extract: extract a stem from full music, reference needed.
+- lego: add/layer track from source audio, reference needed.
+- complete: complete a partial/single track into full track, reference needed.
 """.strip()
-    if audio_hint:
-        system += f"\nVerified direct reference audio URL, use exactly when relevant: {audio_hint}"
     user = {
         "request": prompt,
+        "app_detected_source_title": title or None,
+        "app_detected_edit_target": target or None,
+        "app_reference_policy": (
+            "Reference search is required and handled by the app. Preserve the detected source song; "
+            "your job is to describe the requested arrangement/edit."
+            if title
+            else "No source title detected by the app."
+        ),
         "search_snippets": snippets,
         "example_shape": {
             "candidates": [
@@ -274,8 +707,6 @@ ace_task_type is "text2music" for new music and usually "cover" for edits.
                     "vocal_language": "en",
                     "small_edit_instructions": ["extend outro"],
                     "composition_plan": "specific plan",
-                    "reference_audio_url": None,
-                    "source_reference_query": None,
                     "ace_task_type": "text2music",
                 }
             ]
@@ -340,10 +771,6 @@ def normalize_candidate(value: dict[str, Any]) -> dict[str, Any]:
     if task_type not in {"text2music", "cover", "repaint", "lego", "extract", "complete"}:
         task_type = "text2music"
 
-    ref = text("reference_audio_url") or None
-    if ref and not ref.startswith(("http://", "https://")):
-        ref = None
-
     return {
         "title": text("title", "Untitled"),
         "concept": text("concept", "newly composed"),
@@ -356,21 +783,65 @@ def normalize_candidate(value: dict[str, Any]) -> dict[str, Any]:
         "vocal_language": text("vocal_language", "en"),
         "small_edit_instructions": edits if isinstance(edits, list) and edits else ["extend outro"],
         "composition_plan": text("composition_plan", "Render a complete, structured song."),
-        "reference_audio_url": ref,
-        "source_reference_query": text("source_reference_query") or None,
+        "reference_audio_url": None,
+        "reference_search_query": None,
+        "needs_reference_search": False,
         "ace_task_type": task_type,
     }
 
 
 def source_edit(prompt: str) -> bool:
     prompt = prompt.lower()
-    return any(word in prompt for word in ("edit ", "cover ", "remix", "repaint", "keep the original", "preserve"))
+    return any(
+        word in prompt
+        for word in (
+            "edit ", "cover ", "remix", "repaint", "keep the original", "preserve",
+            "改成", "改为", "改编", "翻唱", "重混", "混音", "保留原曲", "保留", "原曲",
+        )
+    )
+
+
+def instrumental_edit(prompt: str) -> bool:
+    prompt = (prompt or "").lower()
+    return any(
+        word in prompt
+        for word in (
+            "钢琴曲", "钢琴版", "钢琴", "纯音乐", "伴奏", "无人声",
+            "piano", "instrumental", "no vocal", "no vocals",
+        )
+    )
+
+
+def needs_reference_search(prompt: str, candidate: dict[str, Any]) -> bool:
+    return source_edit(prompt) or candidate.get("ace_task_type") in REFERENCE_TASKS
+
+
+def candidate_is_instrumental(candidate: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(candidate.get(key, ""))
+        for key in ("prompt", "lyrics", "concept", "vocal_language")
+    )
+    return instrumental_edit(text) or str(candidate.get("vocal_language", "")).lower() in {
+        "instrumental",
+        "none",
+        "no vocals",
+        "no vocal",
+    }
 
 
 def sanitize_source_candidates(prompt: str, candidates: list[dict[str, Any]], audio_hint: str | None) -> list[dict[str, Any]]:
-    if not source_edit(prompt):
-        return candidates
+    app_query = " / ".join(reference_search_queries(prompt)[:3])
+    title = source_title(prompt)
+    target = edit_target(prompt)
+    is_instrumental = instrumental_edit(prompt)
     safe_lyrics = (
+        "[Intro]\n(Instrumental piano intro preserving the source motif.)\n\n"
+        "[Verse 1]\n(Instrumental piano carries the original verse melody; no vocals.)\n\n"
+        "[Chorus]\n(Instrumental piano states the original chorus hook clearly; no vocals.)\n\n"
+        "[Bridge]\n(Instrumental bridge preserves source structure and harmony while applying the requested arrangement.)\n\n"
+        "[Outro]\n(Instrumental piano outro preserving the source ending shape.)"
+        if is_instrumental
+        else
         "[Intro]\n(Preserve reference intro.)\n\n"
         "[Verse 1]\n(Preserve reference vocal and lyric content.)\n\n"
         "[Chorus]\n(Preserve reference hook.)\n\n"
@@ -378,11 +849,27 @@ def sanitize_source_candidates(prompt: str, candidates: list[dict[str, Any]], au
         "[Outro]\n(Preserve reference ending unless requested.)"
     )
     for candidate in candidates:
-        candidate["lyrics"] = safe_lyrics
-        candidate["ace_task_type"] = "cover"
-        candidate["concept"] = "edited from source; preserve source audio when available"
-        candidate["source_reference_query"] = prompt
-        candidate["reference_audio_url"] = audio_hint or candidate.get("reference_audio_url")
+        should_search = needs_reference_search(prompt, candidate)
+        candidate["needs_reference_search"] = should_search
+        candidate["reference_search_query"] = app_query if should_search else None
+        candidate["reference_audio_url"] = audio_hint if should_search else None
+        if source_edit(prompt):
+            candidate["lyrics"] = safe_lyrics
+            candidate["ace_task_type"] = "cover"
+            candidate["concept"] = "edited from source; preserve source audio when available"
+            edit_style = (
+                "Render as an instrumental piano arrangement with no vocals. "
+                "Keep the source melody, timing, section order, and emotional contour recognizable. "
+                if is_instrumental
+                else
+                "Keep the source melody, vocals, timing, section order, and recognizable hooks unless the user explicitly asked to change them. "
+            )
+            candidate["prompt"] = (
+                f"Preserve the original source song '{title}' as the musical source. "
+                f"Apply only this requested edit: {target or prompt}. "
+                f"{edit_style}"
+                f"{candidate['prompt']}"
+            )
     return candidates
 
 
@@ -394,12 +881,16 @@ def candidate_markdown(candidate: dict[str, Any] | None, index: int, snippets: l
     if not candidate:
         return f"### Candidate {index}\nGenerate samples to fill this tab."
     edits = "\n".join(f"- {item}" for item in candidate["small_edit_instructions"])
+    ref_state = "Yes, app will search reference audio" if candidate.get("needs_reference_search") else "No"
+    if candidate.get("reference_audio_url"):
+        ref_state += " (automatic reference found)"
     return f"""
 ### {index}. {candidate['title']}
 _Used {len(snippets)} Bing snippet(s)._
 
 **Concept:** {candidate['concept']}  
 **ACE task:** `{candidate['ace_task_type']}`  
+**Reference search:** {ref_state}  
 **Metadata:** {candidate['bpm']} BPM, {candidate['key_scale']}, {candidate['time_signature']}/4, {candidate['audio_duration']}s, `{candidate['vocal_language']}`
 
 **Generation prompt**  
@@ -421,8 +912,8 @@ _Used {len(snippets)} Bing snippet(s)._
 def generate_candidates(llm_base: str, llm_key: str, llm_model: str, prompt: str):
     prompt = required(prompt, "Prompt")
     with ThreadPoolExecutor(max_workers=2) as pool:
-        snippets_future = pool.submit(bing_search, prompt)
-        audio_future = pool.submit(itunes_preview, prompt)
+        snippets_future = pool.submit(music_context_search, prompt)
+        audio_future = pool.submit(wider_reference_audio, prompt)
         snippets = snippets_future.result()
         audio_hint = audio_future.result()
 
@@ -462,7 +953,69 @@ def audio_format(url: str, content_type: str = "") -> str:
     return "mp3"
 
 
-def encode_reference(url: str) -> tuple[dict[str, str] | None, str]:
+def probe_audio_duration(raw: bytes, fmt: str) -> float | None:
+    suffix = f".{fmt}" if fmt else ".audio"
+    if suffix == ".mp4":
+        suffix = ".m4a"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as temp:
+            temp.write(raw)
+            temp.flush()
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    temp.name,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        if result.returncode != 0:
+            return None
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except Exception:
+        return None
+
+
+def compress_reference_audio(raw: bytes, fmt: str, max_seconds: int | None) -> tuple[bytes, str]:
+    suffix = ".m4a" if fmt == "mp4" else f".{fmt or 'audio'}"
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as src, tempfile.NamedTemporaryFile(suffix=".mp3") as dst:
+            src.write(raw)
+            src.flush()
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                src.name,
+                "-vn",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                "-b:a",
+                "96k",
+            ]
+            if max_seconds:
+                cmd += ["-t", str(max_seconds)]
+            cmd += [dst.name]
+            result = subprocess.run(cmd, check=False, capture_output=True, timeout=90)
+            if result.returncode == 0 and Path(dst.name).stat().st_size > 512:
+                return Path(dst.name).read_bytes(), "mp3"
+    except Exception:
+        pass
+    return raw, fmt
+
+
+def encode_reference(url: str, max_seconds: int | None = None) -> tuple[dict[str, Any] | None, str]:
     try:
         response = httpx.get(url, timeout=ACE_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
@@ -471,55 +1024,91 @@ def encode_reference(url: str) -> tuple[dict[str, str] | None, str]:
         return None, f"Reference lookup failed: {exc}"
     if len(raw) < 512:
         return None, "Reference lookup returned too little audio data."
+    fmt = audio_format(url, response.headers.get("content-type", ""))
+    duration = probe_audio_duration(raw, fmt)
+    sent_raw, sent_fmt = compress_reference_audio(raw, fmt, max_seconds)
+    sent_duration = probe_audio_duration(sent_raw, sent_fmt)
+    details = f"{len(raw):,} bytes"
+    if duration:
+        details += f", {duration:.1f}s"
+    if sent_raw != raw:
+        details += f"; sending compressed audio {len(sent_raw):,} bytes"
+        if sent_duration:
+            details += f", {sent_duration:.1f}s"
+    meta = REFERENCE_META.get(url)
+    label = f"Matched: {meta}. " if meta else ""
     return (
-        {"base64": base64.b64encode(raw).decode(), "format": audio_format(url, response.headers.get("content-type", ""))},
-        f"Attached automatic reference audio ({len(raw):,} bytes).",
+        {
+            "base64": base64.b64encode(sent_raw).decode(),
+            "format": sent_fmt,
+            "duration": duration,
+            "sent_duration": sent_duration,
+            "url": url,
+        },
+        f"Attached automatic reference audio ({details}). {label}Source: {url}",
     )
 
 
-def resolve_reference(candidate: dict[str, Any], prompt: str) -> tuple[dict[str, str] | None, str]:
+def resolve_reference(candidate: dict[str, Any], prompt: str) -> tuple[dict[str, Any] | None, str]:
+    max_seconds = int(candidate.get("audio_duration") or 0) or None
     for url in [candidate.get("reference_audio_url"), *direct_audio_urls(prompt)]:
         if url:
-            encoded, log = encode_reference(url)
+            encoded, log = encode_reference(url, max_seconds)
             if encoded:
                 return encoded, log
-    if source_edit(prompt):
-        found = itunes_preview(candidate.get("source_reference_query") or prompt)
+    if candidate.get("needs_reference_search"):
+        found = wider_reference_audio(candidate.get("reference_search_query") or prompt)
         if found:
-            return encode_reference(found)
+            return encode_reference(found, max_seconds)
     return None, ""
 
 
-def ace_payload(candidate: dict[str, Any], ace_model: str, ref_audio: dict[str, str] | None) -> dict[str, Any]:
+def ace_payload(candidate: dict[str, Any], ace_model: str, ref_audio: dict[str, Any] | None) -> dict[str, Any]:
     model = ace_model if ace_model and ace_model != "default" else "acemusic/acestep-v1.5-turbo"
     if "/" not in model:
         model = f"acemusic/{model}"
+    is_reference_task = ref_audio is not None
+    is_instrumental = candidate_is_instrumental(candidate)
+    lyrics_for_ace = "" if is_instrumental else candidate["lyrics"]
+    lyrics_block = "Instrumental arrangement. No sung lyrics." if is_instrumental else lyrics_for_ace
+    vocal_language = candidate["vocal_language"]
     text = (
-        f"{candidate['prompt']}\n\nLyrics:\n{candidate['lyrics']}\n\n"
+        f"{candidate['prompt']}\n\nLyrics:\n{lyrics_block}\n\n"
         f"BPM: {candidate['bpm']}\nKey: {candidate['key_scale']}\n"
         f"Time: {candidate['time_signature']}/4\nDuration: {candidate['audio_duration']}s\n"
-        f"Language: {candidate['vocal_language']}"
+        f"Language: {vocal_language}"
     )
     content: str | list[dict[str, Any]] = text
     if ref_audio:
-        content = [{"type": "text", "text": text}, {"type": "input_audio", "input_audio": ref_audio}]
+        content = [
+            {"type": "text", "text": text},
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": ref_audio["base64"],
+                    "format": ref_audio["format"],
+                },
+            },
+        ]
     payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
-        "stream": False,
-        "thinking": True,
-        "use_format": True,
-        "use_cot_caption": True,
-        "use_cot_language": True,
+        "stream": True,
+        "thinking": not is_reference_task,
+        "use_format": not is_reference_task,
+        "use_cot_caption": not is_reference_task,
+        "use_cot_language": not is_reference_task,
         "audio_config": {
             "format": "mp3",
             "duration": candidate["audio_duration"],
             "bpm": candidate["bpm"],
-            "vocal_language": candidate["vocal_language"],
+            "vocal_language": vocal_language,
+            "is_instrumental": is_instrumental,
         },
     }
     if ref_audio:
         payload["task_type"] = candidate["ace_task_type"] if candidate["ace_task_type"] != "text2music" else "cover"
+        payload["instruction"] = candidate["prompt"]
         payload["audio_cover_strength"] = 1.0
     return payload
 
@@ -532,8 +1121,10 @@ def redact_audio(payload: dict[str, Any]) -> dict[str, Any]:
             if "input_audio" in value and isinstance(value["input_audio"], dict):
                 data = value["input_audio"].get("base64") or value["input_audio"].get("data")
                 if isinstance(data, str):
-                    value["input_audio"]["base64"] = f"[base64 audio omitted, {len(data):,} chars]"
-                    value["input_audio"].pop("data", None)
+                    if "data" in value["input_audio"]:
+                        value["input_audio"]["data"] = f"[base64 audio omitted, {len(data):,} chars]"
+                    else:
+                        value["input_audio"]["base64"] = f"[base64 audio omitted, {len(data):,} chars]"
             for child in value.values():
                 walk(child)
         elif isinstance(value, list):
@@ -562,15 +1153,17 @@ def save_audio_item(ace_base: str, item: str) -> str:
         if match:
             suffix = ".wav" if "wav" in match.group(1) else ".mp3"
             item = match.group(2)
-    else:
-        resolved = urljoin(f"{base_url(ace_base)}/", item)
-        if resolved.startswith(("http://", "https://")) and not re.fullmatch(r"[A-Za-z0-9+/=\s]+", item[:160]):
-            suffix = Path(urlparse(resolved).path).suffix or ".mp3"
-            output = OUTPUT_DIR / f"ace-{uuid.uuid4().hex}{suffix}"
-            with httpx.stream("GET", resolved, timeout=ACE_TIMEOUT) as response:
-                response.raise_for_status()
-                output.write_bytes(b"".join(response.iter_bytes()))
-            return str(output)
+        output = OUTPUT_DIR / f"ace-{uuid.uuid4().hex}{suffix}"
+        output.write_bytes(base64.b64decode(item, validate=False))
+        return str(output)
+    resolved = urljoin(f"{base_url(ace_base)}/", item)
+    if resolved.startswith(("http://", "https://")) and not re.fullmatch(r"[A-Za-z0-9+/=\s]+", item[:160]):
+        suffix = Path(urlparse(resolved).path).suffix or ".mp3"
+        output = OUTPUT_DIR / f"ace-{uuid.uuid4().hex}{suffix}"
+        with httpx.stream("GET", resolved, timeout=ACE_TIMEOUT) as response:
+            response.raise_for_status()
+            output.write_bytes(b"".join(response.iter_bytes()))
+        return str(output)
     output = OUTPUT_DIR / f"ace-{uuid.uuid4().hex}.mp3"
     output.write_bytes(base64.b64decode(item, validate=False))
     return str(output)
@@ -585,31 +1178,161 @@ def find_audio_item(data: Any) -> str | None:
     return None
 
 
-def hosted_ace(ace_base: str, ace_key: str, payload: dict[str, Any]) -> tuple[str, str]:
-    response = httpx.post(
-        f"{base_url(ace_base)}/v1/chat/completions",
-        headers=headers(required(ace_key, "ACE API key")),
-        json=payload,
-        timeout=ACE_TIMEOUT,
-    )
-    response.raise_for_status()
-    data = response.json()
-    item = find_audio_item(data)
-    if not item:
-        raise gr.Error("ACE returned no audio item.")
-    text = " ".join(str(s) for s in nested_strings(data)[:3])[:1200]
-    return save_audio_item(ace_base, item), text
+def strip_error_body(body: str) -> str:
+    body = re.sub(r"<(script|style).*?</\1>", " ", body, flags=re.S | re.I)
+    body = re.sub(r"<.*?>", " ", body, flags=re.S)
+    body = html.unescape(re.sub(r"\s+", " ", body)).strip()
+    return body[:700] or "No provider error body."
+
+
+def hosted_ace(ace_base: str, ace_key: str, payload: dict[str, Any]):
+    """Stream ACE /v1/chat/completions with SSE heartbeats to avoid Cloudflare timeouts.
+
+    Yields (heartbeats, elapsed_seconds, lm_content, audio_file) tuples:
+      - heartbeats       : count of "." heartbeat chunks received
+      - elapsed_seconds  : wall-clock seconds since stream started
+      - lm_content       : accumulated response text metadata
+      - audio_file       : None for progress yields; local filepath on final yield
+    Raises gr.Error on unrecoverable failures.
+    """
+    url = f"{base_url(ace_base)}/v1/chat/completions"
+
+    def _run_stream(current_payload: dict[str, Any]):
+        """Inner generator for SSE parsing."""
+        heartbeats = 0
+        lm_content = ""
+        start = time.time()
+
+        try:
+            with httpx.stream(
+                "POST",
+                url,
+                headers=headers(required(ace_key, "ACE API key")),
+                json=current_payload,
+                # connect=30s is plenty for TCP. write=60s allows large payloads.
+                # read=120s must cover the time before the first SSE chunk arrives,
+                # plus any gaps between heartbeats (heartbeats are every ~2s once
+                # generation starts, so this is ~60x headroom).
+                timeout=httpx.Timeout(connect=30.0, read=120.0, write=60.0, pool=10.0),
+            ) as resp:
+                if resp.status_code >= 400:
+                    body = strip_error_body(resp.text)
+                    if resp.status_code == 504:
+                        body = f"{body} The hosted ACE gateway timed out. Try a shorter duration if you want to reduce runtime/cost."
+                    raise gr.Error(f"ACE hosted request failed: HTTP {resp.status_code}. {body}")
+
+                for raw_line in resp.iter_lines():
+                    if not raw_line or not raw_line.startswith("data: "):
+                        continue
+                    if raw_line == "data: [DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(raw_line[6:])
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    finish_reason = choices[0].get("finish_reason")
+
+                    if finish_reason == "error":
+                        err_text = delta.get("content") or "ACE generation failed."
+                        raise gr.Error(f"ACE stream error: {err_text}")
+
+                    # Handle heartbeats (keep connection alive)
+                    content = delta.get("content")
+                    if content == ".":
+                        heartbeats += 1
+                        yield heartbeats, time.time() - start, lm_content, None
+                    elif content:
+                        lm_content += content
+                        yield heartbeats, time.time() - start, lm_content, None
+
+                    # Extract audio from stream
+                    audio_parts = delta.get("audio") or []
+                    if audio_parts:
+                        audio_url_str = (audio_parts[0].get("audio_url") or {}).get("url", "")
+                        if audio_url_str:
+                            audio_file = save_audio_item(ace_base, audio_url_str)
+                            yield heartbeats, time.time() - start, lm_content, audio_file
+                            return
+
+        except gr.Error:
+            raise
+        except Exception as exc:
+            raise gr.Error(redact(f"ACE stream failed: {exc}", ace_key)) from exc
+
+        raise gr.Error("ACE hosted stream ended without returning audio.")
+
+    # --- Main retry loop -----
+    tried_without_ref_audio = False
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            yield from _run_stream(payload)
+            return
+        except gr.Error as exc:
+            exc_str = str(exc)
+            is_transient = (
+                "timeout" in exc_str.lower()
+                or "connection" in exc_str.lower()
+                or "disconnected" in exc_str.lower()
+            )
+
+            # If reference audio is in payload and error is transient, try without it
+            if is_transient and not tried_without_ref_audio:
+                has_ref_audio = False
+                messages = payload.get("messages") or []
+                for msg in messages:
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if block.get("type") == "input_audio":
+                                has_ref_audio = True
+                                break
+
+                if has_ref_audio:
+                    tried_without_ref_audio = True
+                    # Remove reference audio and reference-specific fields from payload
+                    new_payload = json.loads(json.dumps(payload))
+                    for msg in new_payload.get("messages") or []:
+                        content = msg.get("content")
+                        if isinstance(content, list):
+                            msg["content"] = [b for b in content if b.get("type") != "input_audio"]
+                    new_payload.pop("task_type", None)
+                    new_payload.pop("instruction", None)
+                    new_payload.pop("audio_cover_strength", None)
+                    new_payload["thinking"] = True
+                    new_payload["use_format"] = True
+                    new_payload["use_cot_caption"] = True
+                    new_payload["use_cot_language"] = True
+                    yield -1, 0.0, "_Reference audio caused a disconnect — retrying without it…_", None
+                    payload = new_payload
+                    continue
+
+            # Transient error without ref audio → back off and retry
+            if is_transient and attempt < MAX_RETRIES:
+                yield -1, 0.0, f"_Connection error — retrying ({attempt}/{MAX_RETRIES - 1})…_", None
+                time.sleep(RETRY_BACKOFF * attempt)
+                continue
+
+            raise
 
 
 def native_ace(ace_base: str, ace_key: str, candidate: dict[str, Any], ace_model: str) -> str:
+    is_instrumental = candidate_is_instrumental(candidate)
     payload = {
         "prompt": candidate["prompt"],
-        "lyrics": candidate["lyrics"],
+        "lyrics": "" if is_instrumental else candidate["lyrics"],
         "bpm": candidate["bpm"],
         "key_scale": candidate["key_scale"],
         "time_signature": candidate["time_signature"],
         "audio_duration": candidate["audio_duration"],
         "vocal_language": candidate["vocal_language"],
+        "is_instrumental": is_instrumental,
     }
     if ace_model and ace_model != "default":
         payload["model"] = ace_model
@@ -637,20 +1360,58 @@ def render(ace_base: str, ace_key: str, ace_model: str, selected: str, candidate
         raise gr.Error("Generate candidates before rendering.")
     candidate = candidates[selected_index(selected)]
     ref_audio, ref_log = resolve_reference(candidate, prompt)
-    warning = ""
-    if source_edit(prompt) and not ref_audio:
-        warning = "\n\nReference audio was not found automatically, so this render is a text-only approximation."
-        candidate = dict(candidate)
-        candidate["ace_task_type"] = "text2music"
+    if candidate.get("needs_reference_search") and not ref_audio:
+        raise gr.Error(
+            "This is a source-edit/cover task, so ACE needs real reference audio to keep the original song. "
+            "Automatic search did not find a usable direct preview/audio file, so I stopped instead of rendering a different text-only song. "
+            "Try a prompt with the exact song title and artist, or include a direct mp3/m4a/wav URL in the prompt."
+        )
+    if candidate.get("needs_reference_search") and ref_audio:
+        ref_duration = ref_audio.get("duration")
+        requested_duration = candidate.get("audio_duration", 0)
+        if (
+            isinstance(ref_duration, (int, float))
+            and ref_duration < 60
+            and requested_duration > ref_duration + 10
+        ):
+            raise gr.Error(
+                f"The automatic reference is only {ref_duration:.1f}s, but the selected candidate asks for "
+                f"{requested_duration}s. This is probably a preview clip, not the full song, so ACE can only make "
+                "a short or incomplete cover from it. I stopped instead of rendering another 30-second result. "
+                "Use a prompt with a direct authorized full-song mp3/m4a/wav URL, or lower the candidate duration."
+            )
 
     payload = ace_payload(candidate, ace_model or "", ref_audio)
-    log = ["## ACE progress / render log", ref_log, warning, "```json", json.dumps(redact_audio(payload), indent=2), "```"]
+    log = ["## ACE progress / render log", ref_log, "```json", json.dumps(redact_audio(payload), indent=2), "```"]
     yield "\n".join(part for part in log if part), None
 
     try:
         if (urlparse(base_url(ace_base)).hostname or "").lower() == "api.acemusic.ai":
-            audio_file, response_text = hosted_ace(ace_base, ace_key, payload)
-            yield "\n".join([*log, "\nCreated audio via hosted ACE.", response_text, f"\nSaved: `{audio_file}`"]), audio_file
+            # Stream from hosted ACE with SSE heartbeats
+            log.append("Connecting to ACE…")
+            yield "\n".join(log), None
+            
+            lm_content = ""
+            audio_file = None
+            for heartbeats, elapsed, lm_text, af in hosted_ace(ace_base, ace_key, payload):
+                lm_content = lm_text
+                if af is None:
+                    # heartbeats < 0 means retry message, show as log line
+                    if heartbeats < 0:
+                        log.append(lm_text)
+                    else:
+                        # Progress update — show heartbeat counter
+                        log[-1] = f"Generating… {heartbeats} heartbeat(s) ({elapsed:.0f}s elapsed)"
+                    yield "\n".join(log), None
+                else:
+                    # Final yield with audio
+                    audio_file = af
+
+            log[-1] = "Created audio via hosted ACE."
+            if lm_content.strip() and not lm_content.startswith("_"):
+                log.append(lm_content[:1200])
+            log.append(f"Saved: `{audio_file}`")
+            yield "\n".join(log), audio_file
         else:
             audio_file = native_ace(ace_base, ace_key, candidate, ace_model or "")
             yield "\n".join([*log, "\nCreated audio via native ACE.", f"\nSaved: `{audio_file}`"]), audio_file

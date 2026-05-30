@@ -89,6 +89,14 @@ The ACE layer automatically chooses the right backend flow:
 
 Generated audio is saved into `outputs/` and displayed in the audio player.
 
+For source-edit tasks such as cover, repaint, extract, lego/add-layer, and complete,
+the app decides whether reference search is needed. The LLM does not choose that flag
+or provide reference URLs. The app searches automatically using direct prompt URLs,
+Apple previews, and wider Bing queries including Chinese music terms/sites.
+For Chinese edit prompts such as `孤勇者改成钢琴曲`, the app extracts `孤勇者`
+as the source song and `钢琴曲` as the requested arrangement, then gives the LLM
+source-focused Bing snippets so it does not invent an unrelated song.
+
 ## Provider Assumptions
 
 - LLM provider is OpenAI-compatible for:
